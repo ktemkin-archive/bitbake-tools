@@ -1,0 +1,274 @@
+#!/usr/bin/env python
+#
+# Simple, hackish tools for reworking BitBake builds. Useful for enacting partial
+# rebuilds after layer changes.
+#
+#   Copyright (c) 2015 Assured Information Security, Inc. 
+#   Author: Kyle J. Temkin <temkink@ainfosec.com>
+#
+# Recycles code and ideas from bitbake-layers, which is:
+#   Copyright (C) 2011 Mentor Graphics Corporation
+#   Copyright (C) 2012 Intel Corporation
+
+import cmd
+import logging
+import warnings
+import os
+import sys
+import fnmatch
+import imp
+from collections import defaultdict
+
+bindir = os.path.dirname(__file__)
+
+#Load bitbake, so we can delegate to its main.
+imp.load_source("bitbake", "%s/bitbake" % bindir)
+
+topdir = os.path.dirname(bindir)
+sys.path[0:0] = [os.path.join(topdir, 'lib')]
+
+import bb.cache
+import bb.cooker
+import bb.providers
+import bb.utils
+from bb.cooker import state
+import bb.fetch2
+import bitbake
+
+logger = logging.getLogger('BitBake')
+console = logging.StreamHandler(sys.stdout)
+
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+def main(args):
+    # Set up logging
+
+    format = bb.msg.BBLogFormatter("%(levelname)s: %(message)s")
+    bb.msg.addDefaultlogFilter(console)
+    console.setFormatter(format)
+    logger.addHandler(console)
+
+    initialenv = os.environ.copy()
+    bb.utils.clean_environment()
+
+    cmds = Commands(initialenv)
+    if args:
+        # Allow user to specify e.g. show-layers instead of show_layers
+        args = [args[0].replace('-', '_')] + args[1:]
+        cmds.onecmd(' '.join(args))
+    else:
+        cmds.do_help('')
+    return cmds.returncode
+
+
+class Commands(cmd.Cmd):
+    def __init__(self, initialenv):
+        cmd.Cmd.__init__(self)
+        self.returncode = 0
+        self.config = Config(parse_only=True)
+        self.cooker = bb.cooker.BBCooker(self.config,
+                                         self.register_idle_function,
+                                         initialenv)
+        self.config_data = self.cooker.configuration.data
+        bb.providers.logger.setLevel(logging.ERROR)
+        self.cooker_data = None
+        self.bblayers = (self.config_data.getVar('BBLAYERS', True) or "").split()
+
+    def register_idle_function(self, function, data):
+        pass
+
+    def prepare_cooker(self):
+        sys.stderr.write("Parsing recipes..")
+        logger.setLevel(logging.WARNING)
+
+        try:
+            while self.cooker.state in (state.initial, state.parsing):
+                self.cooker.updateCache()
+        except KeyboardInterrupt:
+            self.cooker.shutdown()
+            self.cooker.updateCache()
+            sys.exit(2)
+
+        logger.setLevel(logging.INFO)
+        sys.stderr.write("done.\n")
+
+        self.cooker_data = self.cooker.status
+        self.cooker_data.appends = self.cooker.appendlist
+
+    def check_prepare_cooker(self):
+        if not self.cooker_data:
+            self.prepare_cooker()
+
+    def default(self, line):
+        """Handle unrecognised commands"""
+        sys.stderr.write("Unrecognised command or option\n")
+        self.do_help('')
+
+    def do_help(self, topic):
+        """display general help or help on a specified command"""
+        if topic:
+            sys.stdout.write('%s: ' % topic)
+            cmd.Cmd.do_help(self, topic.replace('-', '_'))
+        else:
+            sys.stdout.write("usage: bitbake-rework <command> [arguments]\n\n")
+            sys.stdout.write("Available commands:\n")
+            procnames = self.get_names()
+            for procname in procnames:
+                if procname[:3] == 'do_':
+                    sys.stdout.write("  %s\n" % procname[3:].replace('_', '-'))
+                    doc = getattr(self, procname).__doc__
+                    if doc:
+                        sys.stdout.write("    %s\n" % doc.splitlines()[0])
+
+
+    def do_show_touched(self, arguments):
+        """prints a list of recipes touched by the given layer
+
+usage: show-touched [-b] 
+-b: Show the list of touched recipes in a format usable as a BitBake argument.
+
+        """
+
+        self.check_prepare_cooker()
+
+        arguments = arguments.split()
+        layer = None
+        bitbake_format = False
+
+        #Parse our arguments.
+        for argument in arguments:
+            if argument ==  '-b':
+                bitbake_format = True
+            else:
+                layer = argument
+
+
+        #Get the list of touched recipes...
+        touched_packages = self.recipes_touched_by_layer(layer)
+        seperator = ' ' if bitbake_format else "\n"
+
+        #... and print them to the screen.
+        logger.plain("\nPackages touched by layer %s:\n" % layer)
+        logger.plain(seperator.join(touched_packages))
+
+    def do_run_on_layer(self, args):
+        """runs a given task on all packages touched by a layer; useful for rebuilding
+        
+usage: run-on-layer <task> layer [additional-layer ...]
+
+Performs the provided task on each of the packages provided by the given layer(s).
+Useful for rebuilding after adding a new layer. Identical to running bitbake -c <task> <recipe>
+
+for every recipe in the layer (but does not reparse recipes between tasks).
+
+        """
+
+        self.check_prepare_cooker()
+
+        arguments = args.split()
+
+        #Ensure we've correctly been provided with arguments.
+        if len(arguments) < 2:
+            logger.error('usage: run-on-layer <task> <layer> [additional-layer ...]')
+            return
+
+        #Extract the task from the list of arguments, and interpret the remaining
+        #parameters as bitbake layers.
+        task = arguments.pop(0)
+        layers = arguments
+
+        touched_recipes = []
+
+        for layer in layers:
+            touched_recipes.extend(self.recipes_touched_by_layer(layer))
+
+        #Clean up state before we pass control to the main bitbake.
+        self.cooker.shutdown()
+        del self.cooker
+        logger.removeHandler(console)
+
+        #XXX Horrid hack that lets us avoid duplicating code from the main bitbake executable.
+        sys.argv = ['bitbake', '-c', task]
+        sys.argv.extend(touched_recipes)
+        print(sys.argv)
+        bitbake.main()
+
+
+
+    def path_for_layer_name(self, layer_name):
+        """Returns the path for the first layer matching a given name."""
+        try:
+            return next(path for path in self.bblayers if path.endswith(layer_name))
+        except StopIteration:
+            raise ValueError('Could not find a layer named \"%s\". Run bitbake-layer show-layers to see a list of known layers.' % layer_name)
+
+
+
+    def recipes_touched_by_layer(self, layer_name):
+        """
+            Returns a list of every recipe name touched by a given layer.
+        """
+
+        touched_recipes = []
+
+        #First, get a list of any recipes that /belong/ to this layer, but have been completely overlayed
+        #by another layer. These recipes won't need to be rebuild-- our "new" changes are overridden by the overlay!
+        files_to_skip = []
+
+        layer_path = self.path_for_layer_name(layer_name)
+
+        #For each recipe that is overlaying another recipe...
+        for recipe in self.cooker.overlayed.iterkeys():
+
+            #... check each of the _overlayed_ ("overridden") recipes to see if they belong to our target layer.
+            for overlayed_recipe in self.cooker.overlayed[recipe]:
+
+                #If they do, add them to our list of recipes to skip.
+                if overlayed_recipe.startswith(layer_path):
+                    files_to_skip.append(overlayed_recipe)
+
+
+        #Walk the layer, reacting to any metadata files we encounter.
+        for root, dirs, files in os.walk(layer_path):
+
+            #For each of the metadata files... 
+            for target_file in files:
+
+                #If we've found a file that seems to be overlayed, skip it.
+                target_path = os.sep.join([root, target_file])
+                if target_path in files_to_skip:
+                    logger.info('Skipping %s, as it appears to be completely overlayed by another layer.' % target_path )
+                    continue
+
+                #Otherwise, determine the file's extension.
+                base, extension = os.path.splitext(target_file)
+
+                #If we have a file that contains bitbake metadata, include the package in the list
+                #of packages that are touched by our layer.
+                if extension in ['.bbappend', '.bb']:
+                    name = base.split('_')[0]
+                    touched_recipes.append(name)
+
+
+        return touched_recipes
+
+
+class Config(object):
+    def __init__(self, **options):
+        self.pkgs_to_build = []
+        self.debug_domains = []
+        self.extra_assume_provided = []
+        self.prefile = []
+        self.postfile = []
+        self.debug = 0
+        self.__dict__.update(options)
+
+    def __getattr__(self, attribute):
+        try:
+            return super(Config, self).__getattribute__(attribute)
+        except AttributeError:
+            return None
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]) or 0)
