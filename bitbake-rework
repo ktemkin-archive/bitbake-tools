@@ -9,6 +9,50 @@
 # Recycles code and ideas from bitbake-layers, which is:
 #   Copyright (C) 2011 Mentor Graphics Corporation
 #   Copyright (C) 2012 Intel Corporation
+#
+#
+# USAGE
+# ==========
+#
+# This tool is meant to be placed in your bitbake binary folder, and
+# invoked as you would a bitbake tool. OpenXT users, this means you should 
+# place this script in <your_build_path>/build/repos/bitbake/bin/.
+#
+# Also:
+#   --As with the other bitbake tools, you must either set BBPATH to your build
+#     dir (<your_build_path>/build), or run this from that build directory.
+#   --You'll also need to pass in a MACHINE in the bitbake standard format-- the
+#     simplest way is to set the machine in your conf/local.conf. For example:
+#     
+#         MACHINE ?= "xenclient-dom0"
+#
+#     You can also enable selection of the machine in your environment by exporting
+#     the environment variable BB_ENV_EXTRAWHITE...
+#
+#         export BB_ENV_EXTRAWHITE="MACHINE"
+#
+#     ... which lets you call the tool like so:
+#
+#         MACHINE="xenclient-dom0" bitbake-rework help
+#     
+# Once you have that set up, you can easily add layers and then see the packages
+# they touch:
+#
+#       bitbake-rework show-touched -b <layer_name>
+#
+# The -b flag puts the output in a format that can easily be pasted (or xarg'd) onto
+# bitbake commands. Omitting -b will produce a more human-readable format.
+#
+# As a convenience, you can also have bitbake run a task on every package touched by
+# a layer:
+#
+#       bitbake-rework run-on-layer <task> <layer_name>
+#
+# For example:
+#
+#       bitbake-rework run-on-layer clean meta-my-recently-installed-layer
+#
+
 
 import cmd
 import logging
@@ -190,7 +234,6 @@ for every recipe in the layer (but does not reparse recipes between tasks).
         #XXX Horrid hack that lets us avoid duplicating code from the main bitbake executable.
         sys.argv = ['bitbake', '-c', task]
         sys.argv.extend(touched_recipes)
-        print(sys.argv)
         bitbake.main()
 
 
